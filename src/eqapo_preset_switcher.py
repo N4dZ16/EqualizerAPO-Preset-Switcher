@@ -37,6 +37,10 @@ GREEN, ORANGE, RED, GREY = "#2e7d32", "#c77700", "#c62828", "#546e7a"
 
 PREAMP_RE = re.compile(r"^\s*Preamp\s*:\s*([-+]?\d+(?:\.\d+)?)\s*dB\b.*$", re.I)
 INCLUDE_RE = re.compile(r"^\s*Include\s*:\s*(.+?)\s*$", re.I)
+COMMENTED_INCLUDE_RE = re.compile(r"^\s*#+\s*Include\s*:\s*(.+?)\s*$", re.I)
+
+# Window icon: looked up in an "assets" folder next to the script (or one level up).
+ICON_NAMES = ("eqapo-switcher-no-bg-ico", "eqapo-switcher-no-bg")
 
 
 # --------------------------------------------------------------------------
@@ -129,40 +133,124 @@ def fmt_field(value):
     return f"{round(value, 1) + 0.0:.1f}"
 
 
+def _clean(value):
+    return value.strip().strip('"')
+
+
 def parse_config(text):
-    """Return (preamp, include) from the first matching lines; None if absent."""
-    preamp = include = None
+    """Return (preamp, include, commented_include).
+
+    `include` is the first active Include line; `commented_include` the first
+    "# Include: ..." line. Each is None if absent.
+    """
+    preamp = include = commented = None
     for line in text.splitlines():
         m = PREAMP_RE.match(line)
         if m and preamp is None:
             preamp = float(m.group(1))
             continue
         m = INCLUDE_RE.match(line)
-        if m and include is None:
-            include = m.group(1).strip().strip('"')
-    return preamp, include
+        if m:
+            if include is None:
+                include = _clean(m.group(1))
+            continue
+        m = COMMENTED_INCLUDE_RE.match(line)
+        if m and commented is None:
+            commented = _clean(m.group(1))
+    return preamp, include, commented
 
 
-def update_config(text, preamp, include):
-    """Replace the first Preamp/Include lines (adding them if missing); keep everything else."""
+def update_config(text, preamp, include, remembered=None):
+    """Set the Preamp value and the preset file name, WITHOUT changing on/off state.
+
+    - An active "Include:" line gets the new name and stays active.
+    - If the preset is off, the "# Include:" line gets the new name and stays commented
+      (the one matching `remembered` if there are several, else the first).
+    - If there is no Include line at all, an active one is added.
+    Everything else in the file is left untouched.
+    """
     newline = "\r\n" if "\r\n" in text else "\n"
     preamp_line = f"Preamp: {fmt_preamp(preamp)} dB"
-    include_line = f"Include: {include}"
+    lines = text.splitlines()
+
+    commented_idx = None
+    if not any(INCLUDE_RE.match(l) for l in lines):
+        first = None
+        for i, l in enumerate(lines):
+            m = COMMENTED_INCLUDE_RE.match(l)
+            if not m:
+                continue
+            if first is None:
+                first = i
+            if remembered and _clean(m.group(1)).lower() == remembered.lower():
+                commented_idx = i
+                break
+        if commented_idx is None:
+            commented_idx = first
+
     out, done_p, done_i = [], False, False
-    for line in text.splitlines():
+    for i, line in enumerate(lines):
         if not done_p and PREAMP_RE.match(line):
             out.append(preamp_line)
             done_p = True
         elif not done_i and INCLUDE_RE.match(line):
-            out.append(include_line)
+            out.append(f"Include: {include}")
+            done_i = True
+        elif not done_i and i == commented_idx:
+            lead = line[: len(line) - len(line.lstrip())]
+            out.append(f"{lead}# Include: {include}")
             done_i = True
         else:
             out.append(line)
     if not done_p:
         out.insert(0, preamp_line)
     if not done_i:
-        out.append(include_line)
+        out.append(f"Include: {include}")
     return newline.join(out) + newline
+
+
+def disable_include(text):
+    """Comment out the active Include line(s): "Include: X" -> "# Include: X".
+
+    Returns (new_text, name_of_first_include) or None if there was nothing to do.
+    """
+    newline = "\r\n" if "\r\n" in text else "\n"
+    out, first = [], None
+    for line in text.splitlines():
+        m = INCLUDE_RE.match(line)
+        if m:
+            if first is None:
+                first = _clean(m.group(1))
+            lead = line[: len(line) - len(line.lstrip())]
+            out.append(f"{lead}# {line.strip()}")
+        else:
+            out.append(line)
+    if first is None:
+        return None
+    return newline.join(out) + newline, first
+
+
+def enable_include(text, prefer=None):
+    """Uncomment one "# Include: X" line: the one for `prefer` if present, else the first."""
+    newline = "\r\n" if "\r\n" in text else "\n"
+    lines = text.splitlines()
+    first = chosen = None
+    for i, line in enumerate(lines):
+        m = COMMENTED_INCLUDE_RE.match(line)
+        if not m:
+            continue
+        if first is None:
+            first = i
+        if prefer and _clean(m.group(1)).lower() == prefer.lower():
+            chosen = i
+            break
+    idx = chosen if chosen is not None else first
+    if idx is None:
+        return None
+    line = lines[idx]
+    lead = line[: len(line) - len(line.lstrip())]
+    lines[idx] = lead + re.sub(r"^\s*#+\s*", "", line)
+    return newline.join(lines) + newline
 
 
 def list_presets(folder):
@@ -285,11 +373,13 @@ class App(tk.Tk):
         super().__init__()
         self.title(APP_TITLE)
         self.scale = self.winfo_fpixels("1i") / 96.0
+        self._set_icon()
 
         self.settings = load_settings()
         self.folder = None
         self.presets = []
         self.active_include = None
+        self.commented_include = None
         self.active_preamp = None
         self.last_valid = 0.0
         self._mtime = None
@@ -306,6 +396,38 @@ class App(tk.Tk):
         self.reload(initial=True)
         self.after(POLL_MS, self._poll)
 
+    # ---- window icon -----------------------------------------------------
+    def _set_icon(self):
+        roots = []
+        if getattr(sys, "frozen", False):
+            roots.append(getattr(sys, "_MEIPASS", os.path.dirname(sys.executable)))
+        here = os.path.dirname(os.path.abspath(__file__))
+        roots += [here, os.path.dirname(here)]
+        for root in roots:
+            assets = os.path.join(root, "assets")
+            if not os.path.isdir(assets):
+                continue
+            candidates = [n + ext for n in ICON_NAMES for ext in (".ico", ".png", "")]
+            others = sorted(os.listdir(assets), key=lambda n: (not n.lower().endswith(".ico"), n.lower()))
+            candidates += [n for n in others if n.lower().endswith((".ico", ".png"))]
+            for name in candidates:
+                path = os.path.join(assets, name)
+                if os.path.isfile(path) and self._try_icon(path):
+                    return
+
+    def _try_icon(self, path):
+        try:
+            with open(path, "rb") as f:
+                head = f.read(4)
+            if head == b"\x00\x00\x01\x00":  # .ico
+                self.iconbitmap(path)
+            else:  # PNG/GIF
+                self._icon_img = tk.PhotoImage(file=path)
+                self.iconphoto(True, self._icon_img)
+            return True
+        except (OSError, tk.TclError):
+            return False
+
     # ---- layout ----------------------------------------------------------
     def px(self, n):
         return int(round(n * self.scale))
@@ -317,6 +439,7 @@ class App(tk.Tk):
                 style.theme_use(theme)
                 break
         style.configure("Apply.TButton", font=(FONT, 11, "bold"), padding=8)
+        style.configure("Toggle.TButton", font=(FONT, 10), padding=5)
         bg = style.lookup("TFrame", "background") or self.cget("bg")
         win_w = self.px(460)
         cw = win_w - 2 * self.px(18)  # content width
@@ -379,8 +502,15 @@ class App(tk.Tk):
         )
         self.error_label.pack(fill="x", pady=(2, 4))
 
-        self.apply_btn = ttk.Button(root, text="Apply preset", style="Apply.TButton", command=self.apply)
-        self.apply_btn.pack(fill="x", pady=(0, 14))
+        btn_row = ttk.Frame(root)
+        btn_row.pack(fill="x", pady=(0, 8))
+        self.reset_btn = ttk.Button(btn_row, text="Reset", style="Apply.TButton", command=self.reset, width=8)
+        self.reset_btn.pack(side="left", padx=(0, 8))
+        self.apply_btn = ttk.Button(btn_row, text="Apply preset", style="Apply.TButton", command=self.apply)
+        self.apply_btn.pack(side="left", fill="x", expand=True)
+
+        self.toggle_btn = ttk.Button(root, text="Turn preset OFF", style="Toggle.TButton", command=self.toggle)
+        self.toggle_btn.pack(fill="x", pady=(0, 14))
 
         foot = ttk.Frame(root)
         foot.pack(fill="x")
@@ -451,6 +581,7 @@ class App(tk.Tk):
     def reload(self, initial=False):
         keep = None if initial else self.selected_preset()
         self.presets, self.active_preamp, self.active_include = [], None, None
+        self.commented_include = None
         if self.folder:
             try:
                 self.presets = list_presets(self.folder)
@@ -460,7 +591,7 @@ class App(tk.Tk):
             try:
                 with open(cfg, "rb") as f:
                     text, _ = decode_text(f.read())
-                self.active_preamp, self.active_include = parse_config(text)
+                self.active_preamp, self.active_include, self.commented_include = parse_config(text)
                 self._mtime = os.path.getmtime(cfg)
             except OSError:
                 self._mtime = None
@@ -469,14 +600,19 @@ class App(tk.Tk):
             self.preamp_var.set(fmt_field(self.active_preamp))
         self.update_status()
 
+    def _current_include(self):
+        """The preset named in config.txt: the active Include, else the commented one (off)."""
+        return self.active_include if self.active_include is not None else self.commented_include
+
     def _rebuild_combo(self, prefer):
+        mark = "\u25cf " if self.active_include is not None else "\u25cb "  # filled = on, hollow = off
+        cur = self._current_include()
         self.combo["values"] = [
-            ("\u25cf " if same_preset(self.active_include, n, self.folder) else "    ") + n
-            for n in self.presets
+            (mark if same_preset(cur, n, self.folder) else "    ") + n for n in self.presets
         ]
         target = prefer if prefer in self.presets else None
         if target is None:
-            target = next((n for n in self.presets if same_preset(self.active_include, n, self.folder)), None)
+            target = next((n for n in self.presets if same_preset(cur, n, self.folder)), None)
         if target is None and self.presets:
             target = self.presets[0]
         if target is not None:
@@ -533,7 +669,8 @@ class App(tk.Tk):
         value, err = parse_preamp_input(self.preamp_var.get())
 
         info_p = "not set" if self.active_preamp is None else f"{fmt_preamp(self.active_preamp)} dB"
-        info_i = self.active_include or "none"
+        off = self.active_include is None and self.commented_include is not None
+        info_i = self.active_include or (f"OFF (# {self.commented_include})" if off else "none")
         self.config_info.set(f"config.txt \u2192 Preamp: {info_p}  \u00b7  Include: {info_i}")
 
         if not self.folder:
@@ -543,9 +680,13 @@ class App(tk.Tk):
         elif err is not None:
             text, color, can_apply = "Invalid preamp \u2013 fix the value to apply.", RED, False
         else:
-            preset_ok = same_preset(self.active_include, sel, self.folder)
+            preset_ok = same_preset(self._current_include(), sel, self.folder)
             preamp_ok = self.active_preamp is not None and abs(value - self.active_preamp) < 0.05
-            if preset_ok and preamp_ok:
+            if off and preset_ok and preamp_ok:
+                text, color, can_apply = "Preset OFF \u2013 this preset is set in config.txt but switched off.", GREY, False
+            elif off:
+                text, color, can_apply = f"Preset OFF \u2013 changes not applied yet (config.txt: {info_i}).", ORANGE, True
+            elif preset_ok and preamp_ok:
                 text, color, can_apply = "\u2714  Active \u2013 this preset and preamp are applied.", GREEN, False
             elif preset_ok:
                 text, color, can_apply = (
@@ -558,24 +699,93 @@ class App(tk.Tk):
         self.banner.set(text, bg=color)
         self.apply_btn.state(["!disabled"] if can_apply else ["disabled"])
 
+        if self.folder and (self.active_include is not None or off):
+            self.toggle_btn.config(text="Turn preset ON" if off else "Turn preset OFF")
+            self.toggle_btn.state(["!disabled"])
+        else:
+            self.toggle_btn.config(text="Turn preset OFF")
+            self.toggle_btn.state(["disabled"])
+
+        # Reset is useful whenever the UI differs from what's in config.txt.
+        active_name = self._active_preset_name()
+        differs = (active_name is not None and sel != active_name) or (
+            self.active_preamp is not None and (err is not None or abs(value - self.active_preamp) >= 0.05)
+        )
+        self.reset_btn.state(["!disabled"] if (self.folder and differs) else ["disabled"])
+
+    def _active_preset_name(self):
+        cur = self._current_include()
+        return next((n for n in self.presets if same_preset(cur, n, self.folder)), None)
+
+    def reset(self):
+        """Put the selection and preamp back to what config.txt currently has."""
+        name = self._active_preset_name()
+        if name is not None:
+            self.combo.current(self.presets.index(name))
+        if self.active_preamp is not None:
+            self.preamp_var.set(fmt_field(self.active_preamp))
+        self.error_var.set("")
+        self.update_status()
+
+    def _modify_config(self, transform):
+        """Read config.txt, apply transform(text) -> new text (or None), write it back."""
+        cfg = os.path.join(self.folder, CONFIG_NAME)
+        try:
+            with open(cfg, "rb") as f:
+                text, enc = decode_text(f.read())
+            new_text = transform(text)
+            if new_text is None:
+                return False
+            data = encode_text(new_text, enc)
+            with open(cfg, "wb") as f:
+                f.write(data)
+        except PermissionError:
+            self._handle_permission_error()
+            return False
+        except OSError as exc:
+            messagebox.showerror(APP_TITLE, f"Couldn't write {CONFIG_NAME}:\n{exc}")
+            return False
+        return True
+
     def apply(self):
         sel = self.selected_preset()
         value, err = parse_preamp_input(self.preamp_var.get())
         if not self.folder or sel is None or err is not None:
             return
-        cfg = os.path.join(self.folder, CONFIG_NAME)
-        try:
-            with open(cfg, "rb") as f:
-                text, enc = decode_text(f.read())
-            data = encode_text(update_config(text, value, sel), enc)
-            with open(cfg, "wb") as f:
-                f.write(data)
-        except PermissionError:
-            self._handle_permission_error()
+        remembered = self.settings.get("last_disabled_include")
+        was_off = {}
+
+        def change(text):
+            _, include, commented = parse_config(text)
+            was_off["v"] = include is None and commented is not None
+            return update_config(text, value, sel, remembered)
+
+        if self._modify_config(change):
+            if was_off.get("v"):  # still off: remember which commented line is ours
+                self.settings["last_disabled_include"] = sel
+                save_settings(self.settings)
+            self.reload()
+
+    def toggle(self):
+        """Comment / uncomment the Include line. The Preamp line is left as is."""
+        if not self.folder:
             return
-        except OSError as exc:
-            messagebox.showerror(APP_TITLE, f"Couldn't write {CONFIG_NAME}:\n{exc}")
-            return
+        if self.active_include is not None:
+            disabled = {}
+
+            def turn_off(text):
+                result = disable_include(text)
+                if result is None:
+                    return None
+                disabled["name"] = result[1]
+                return result[0]
+
+            if self._modify_config(turn_off) and disabled:
+                self.settings["last_disabled_include"] = disabled["name"]
+                save_settings(self.settings)
+        elif self.commented_include is not None:
+            prefer = self.settings.get("last_disabled_include")
+            self._modify_config(lambda text: enable_include(text, prefer))
         self.reload()
 
     def _handle_permission_error(self):
