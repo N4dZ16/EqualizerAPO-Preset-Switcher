@@ -46,4 +46,4 @@ Include: Vocal Forward.txt
 
 ## License
 
-MIT (add a `LICENSE` file when you publish).
+MIT
